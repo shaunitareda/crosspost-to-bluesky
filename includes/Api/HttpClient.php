@@ -37,12 +37,33 @@ class HttpClient {
         }
         $code = wp_remote_retrieve_response_code( $response );
         $body = json_decode( wp_remote_retrieve_body( $response ), true );
-        $this->logger->debug( 'HTTP response', [ 'url' => $url, 'status' => $code, 'body' => $body ] );
+        $this->logger->debug( 'HTTP response', [ 'url' => $url, 'status' => $code, 'body' => $this->redact_sensitive( $body ) ] );
         if ( $code < 200 || $code >= 300 ) {
             $msg = $body['message'] ?? ( 'HTTP ' . $code );
             $this->logger->error( 'HTTP error: ' . $msg, [ 'url' => $url, 'status' => $code ] );
             return new \WP_Error( 'ctb_http_error', $msg, [ 'status' => $code ] );
         }
         return is_array( $body ) ? $body : [];
+    }
+
+    private function redact_sensitive( $value ) {
+        if ( ! is_array( $value ) ) return $value;
+        $sensitive = [
+            'password', 'app_password', 'token', 'access_token', 'refresh_token',
+            'accessjwt', 'refreshjwt', 'jwt', 'client_secret', 'authorization',
+        ];
+        $clean = [];
+        foreach ( $value as $key => $item ) {
+            $normalized = strtolower( str_replace( [ '-', '_' ], '', (string) $key ) );
+            $blocked = false;
+            foreach ( $sensitive as $name ) {
+                if ( $normalized === strtolower( str_replace( [ '-', '_' ], '', $name ) ) ) {
+                    $blocked = true;
+                    break;
+                }
+            }
+            $clean[ $key ] = $blocked ? '[REDACTED]' : $this->redact_sensitive( $item );
+        }
+        return $clean;
     }
 }

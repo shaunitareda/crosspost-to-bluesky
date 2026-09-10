@@ -33,6 +33,11 @@ class PostCreator {
             'langs'     => [ $this->locale_to_lang( get_locale() ) ],
         ];
 
+        $facets = $this->build_facets( $text );
+        if ( ! empty( $facets ) ) {
+            $record['facets'] = $facets;
+        }
+
         // ── Video takes priority over images (can't embed both) ───────────
         $video_embed = null;
         if ( $this->options->get( 'video_enabled', 1 ) ) {
@@ -210,7 +215,7 @@ class PostCreator {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // TEXT
+    // TEXT / FACETS
     // ─────────────────────────────────────────────────────────────────────────
 
     private function build_text( \WP_Post $post ): string {
@@ -224,12 +229,81 @@ class PostCreator {
         $permalink = get_permalink( $post );
         $is_note   = ( ! $title || 'post-format-status' === get_post_format( $post ) || $post->post_type === 'indieblocks_note' );
         if ( $is_note ) $template = preg_replace( '/^\{title\}\s*/m', '', $template );
+
+        // Avoid awkward title/body duplication while preserving custom templates.
+        if (
+            false !== strpos( $template, '{title}' ) &&
+            false !== strpos( $template, '{content}' ) &&
+            '' !== $title &&
+            $this->normalize_for_compare( $title ) === $this->normalize_for_compare( $content )
+        ) {
+            $content = '';
+        }
+
         $text = strtr( $template, [ '{title}' => $title, '{excerpt}' => $excerpt, '{content}' => $content, '{url}' => $permalink ] );
         if ( $this->options->get( 'include_permalink', 0 ) ) $text .= "\n\n" . $permalink;
         $text = trim( preg_replace( '/\n{3,}/', "\n\n", $text ) );
         if ( mb_strlen( $text ) > 300 ) $text = mb_substr( $text, 0, 297 ) . '...';
         $this->logger->debug( 'Built text.', [ 'text' => $text ] );
         return $text;
+    }
+
+    private function normalize_for_compare( string $text ): string {
+        $text = html_entity_decode( wp_strip_all_tags( $text ), ENT_QUOTES, 'UTF-8' );
+        $text = preg_replace( '/\s+/u', ' ', trim( $text ) );
+        $text = preg_replace( '/[.!?。！？]+$/u', '', $text );
+        return mb_strtolower( trim( $text ), 'UTF-8' );
+    }
+
+    /**
+     * Build AT Protocol rich-text facets from the final post text.
+     * PREG_OFFSET_CAPTURE returns byte offsets, which is exactly what ATProto expects.
+     */
+    private function build_facets( string $text ): array {
+        $facets = [];
+        $link_ranges = [];
+
+        if ( preg_match_all( '~https?://[^\s<>"\']+~iu', $text, $matches, PREG_OFFSET_CAPTURE ) ) {
+            foreach ( $matches[0] as [ $raw_url, $start ] ) {
+                $url = rtrim( $raw_url, ".,!?;:)]}" );
+                if ( '' === $url ) continue;
+                $end = $start + strlen( $url );
+                $link_ranges[] = [ $start, $end ];
+                $facets[] = [
+                    'index' => [ 'byteStart' => $start, 'byteEnd' => $end ],
+                    'features' => [
+                        [ '$type' => 'app.bsky.richtext.facet#link', 'uri' => $url ],
+                    ],
+                ];
+            }
+        }
+
+        if ( preg_match_all( '/(?<![\p{L}\p{M}\p{N}_])#([\p{L}\p{M}\p{N}_]+)/u', $text, $matches, PREG_OFFSET_CAPTURE ) ) {
+            foreach ( $matches[0] as $i => [ $full, $start ] ) {
+                $end = $start + strlen( $full );
+                if ( $this->range_overlaps( $start, $end, $link_ranges ) ) continue;
+
+                $tag = $matches[1][ $i ][0] ?? '';
+                if ( '' === $tag ) continue;
+
+                $facets[] = [
+                    'index' => [ 'byteStart' => $start, 'byteEnd' => $end ],
+                    'features' => [
+                        [ '$type' => 'app.bsky.richtext.facet#tag', 'tag' => $tag ],
+                    ],
+                ];
+            }
+        }
+
+        usort( $facets, fn( array $a, array $b ): int => $a['index']['byteStart'] <=> $b['index']['byteStart'] );
+        return $facets;
+    }
+
+    private function range_overlaps( int $start, int $end, array $ranges ): bool {
+        foreach ( $ranges as [ $range_start, $range_end ] ) {
+            if ( $start < $range_end && $end > $range_start ) return true;
+        }
+        return false;
     }
 
     private function locale_to_lang( string $locale ): string {

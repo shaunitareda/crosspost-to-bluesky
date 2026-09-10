@@ -12,7 +12,7 @@ class Auth {
         if ( ! $identifier || ! $password ) {
             return new \WP_Error( 'ctb_no_creds', 'Bluesky identifier or app password not configured. Go to Settings → Crosspost to Bluesky.' );
         }
-        $this->logger->debug( 'Creating Bluesky session.', [ 'identifier' => $identifier ] );
+        $this->logger->debug( 'Creating Bluesky session.' );
         return $this->http->post_json(
             $host . '/xrpc/com.atproto.server.createSession',
             [ 'identifier' => $identifier, 'password' => $password ]
