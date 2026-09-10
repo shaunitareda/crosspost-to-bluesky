@@ -22,9 +22,11 @@ class SettingsPage {
     }
     public function sanitize( $raw ): array {
         if ( ! is_array( $raw ) ) $raw = [];
+        $existing = $this->options->all();
+        $password = sanitize_text_field( $raw['app_password'] ?? '' );
         return [
             'identifier'         => sanitize_text_field( $raw['identifier'] ?? '' ),
-            'app_password'       => sanitize_text_field( $raw['app_password'] ?? '' ),
+            'app_password'       => '' !== $password ? $password : (string) ( $existing['app_password'] ?? '' ),
             'pds_host'           => esc_url_raw( $raw['pds_host'] ?? 'https://bsky.social' ),
             'enabled_post_types' => array_map( 'sanitize_key', (array) ( $raw['enabled_post_types'] ?? [ 'post' ] ) ),
             'auto_crosspost'     => ! empty( $raw['auto_crosspost'] ) ? 1 : 0,
@@ -57,6 +59,7 @@ class SettingsPage {
     public function render(): void {
         if ( ! current_user_can( 'manage_options' ) ) return;
         $opts       = $this->options->all();
+        $opts['app_password'] = '';
         $post_types = get_post_types( [ 'public' => true ], 'objects' );
         $log        = $this->logger->get_entries();
         $active_tab = sanitize_key( $_GET['tab'] ?? 'settings' );
