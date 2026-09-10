@@ -231,13 +231,15 @@ class PostCreator {
         if ( $is_note ) $template = preg_replace( '/^\{title\}\s*/m', '', $template );
 
         // Avoid awkward title/body duplication while preserving custom templates.
+        // If content starts with the post title, remove only that leading copy and
+        // keep the rest of the body intact. Matching tolerates whitespace and
+        // sentence-ending punctuation differences (for example "Memo" vs "Memo.").
         if (
             false !== strpos( $template, '{title}' ) &&
             false !== strpos( $template, '{content}' ) &&
-            '' !== $title &&
-            $this->normalize_for_compare( $title ) === $this->normalize_for_compare( $content )
+            '' !== $title
         ) {
-            $content = '';
+            $content = $this->strip_leading_duplicate_title( $title, $content );
         }
 
         $text = strtr( $template, [ '{title}' => $title, '{excerpt}' => $excerpt, '{content}' => $content, '{url}' => $permalink ] );
@@ -253,6 +255,29 @@ class PostCreator {
         $text = preg_replace( '/\s+/u', ' ', trim( $text ) );
         $text = preg_replace( '/[.!?。！？]+$/u', '', $text );
         return mb_strtolower( trim( $text ), 'UTF-8' );
+    }
+
+    private function strip_leading_duplicate_title( string $title, string $content ): string {
+        $normalized_title = $this->normalize_for_compare( $title );
+        if ( '' === $normalized_title || '' === trim( $content ) ) return $content;
+
+        $parts = preg_split( '/\s+/u', $normalized_title, -1, PREG_SPLIT_NO_EMPTY );
+        if ( empty( $parts ) ) return $content;
+
+        $pattern = implode( '\\s+', array_map(
+            static fn( string $part ): string => preg_quote( $part, '/' ),
+            $parts
+        ) );
+
+        $deduped = preg_replace(
+            '/^\s*' . $pattern . '(?:[.!?。！？]+)?(?=\s|$)\s*/iu',
+            '',
+            $content,
+            1,
+            $count
+        );
+
+        return $count > 0 ? trim( (string) $deduped ) : $content;
     }
 
     /**
