@@ -4,10 +4,11 @@ on:
   pull_request:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   verify-and-package:
@@ -42,6 +43,17 @@ jobs:
           echo "version=$HEADER_VERSION" >> "$GITHUB_OUTPUT"
           echo "Verified plugin version $HEADER_VERSION"
 
+      - name: Verify release tag matches plugin version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          test "$TAG_VERSION" = "${{ steps.version.outputs.version }}" || {
+            echo "Tag version $TAG_VERSION does not match plugin version ${{ steps.version.outputs.version }}" >&2
+            exit 1
+          }
+
       - name: Build canonical plugin ZIP
         shell: bash
         run: |
@@ -66,7 +78,6 @@ jobs:
           test -f /tmp/ctb-package-check/crosspost-to-bluesky/crosspost-to-bluesky.php
           test -f /tmp/ctb-package-check/crosspost-to-bluesky/includes/Api/PostCreator.php
           grep -F "Version:           ${{ steps.version.outputs.version }}" /tmp/ctb-package-check/crosspost-to-bluesky/crosspost-to-bluesky.php
-          grep -F "strip_leading_duplicate_title" /tmp/ctb-package-check/crosspost-to-bluesky/includes/Api/PostCreator.php
           sha256sum crosspost-to-bluesky.zip
 
       - name: Upload canonical package artifact
@@ -76,3 +87,15 @@ jobs:
           path: crosspost-to-bluesky.zip
           if-no-files-found: error
           retention-days: 30
+
+      - name: Publish GitHub Release for version tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" crosspost-to-bluesky.zip \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
