@@ -8,7 +8,7 @@ class Options {
         'pds_host'           => 'https://bsky.social',
         'enabled_post_types' => [ 'post' ],
         'auto_crosspost'     => 1,
-        'template'           => "{title}\n\n{content}",
+        'template'           => "{title}\n{content}",
         'include_permalink'  => 0,
         'debug_enabled'      => 0,
         'video_enabled'      => 1,
