@@ -3,7 +3,7 @@
  * Plugin Name:       Crosspost to Bluesky
  * Plugin URI:        https://github.com/evecodes/crosspost-to-bluesky
  * Description:       Crossposts WordPress posts and Social Notes (Tusky/Enable Mastodon Apps) to Bluesky with native image and video uploads.
- * Version:           1.2.1
+ * Version:           1.2.2
  * Requires at least: 6.0
  * Requires PHP:      8.0
  * Author:            evecodes
@@ -12,7 +12,7 @@
  * Domain Path:       /languages
  */
 if ( ! defined( 'ABSPATH' ) ) exit;
-define( 'CTB_VERSION',    '1.2.1' );
+define( 'CTB_VERSION',    '1.2.2' );
 define( 'CTB_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'CTB_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 
