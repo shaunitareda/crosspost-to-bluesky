@@ -219,7 +219,7 @@ class PostCreator {
     // ─────────────────────────────────────────────────────────────────────────
 
     private function build_text( \WP_Post $post ): string {
-        $template  = (string) $this->options->get( 'template', "{title}\n\n{content}" );
+        $template  = (string) $this->options->get( 'template', "{title}\n{content}" );
         $title     = wp_strip_all_tags( html_entity_decode( get_the_title( $post ), ENT_QUOTES, 'UTF-8' ) );
         $raw       = wp_strip_all_tags( strip_shortcodes( $post->post_content ) );
         $excerpt   = has_excerpt( $post )
@@ -229,6 +229,13 @@ class PostCreator {
         $permalink = get_permalink( $post );
         $is_note   = ( ! $title || 'post-format-status' === get_post_format( $post ) || $post->post_type === 'indieblocks_note' );
         if ( $is_note ) $template = preg_replace( '/^\{title\}\s*/m', '', $template );
+
+        // Bluesky has no title/body distinction. Treat WordPress titles as a
+        // leading fragment of the same post rather than forcing a paragraph break.
+        // This is Bluesky-only formatting; the WordPress post itself is untouched.
+        if ( false !== strpos( $template, '{title}' ) && false !== strpos( $template, '{content}' ) ) {
+            $template = preg_replace( '/\{title\}\s*\R+\s*\{content\}/u', '{title} {content}', $template );
+        }
 
         // Avoid awkward title/body duplication while preserving custom templates.
         // If content starts with the post title, remove only that leading copy and
