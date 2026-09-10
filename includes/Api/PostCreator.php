@@ -33,11 +33,6 @@ class PostCreator {
             'langs'     => [ $this->locale_to_lang( get_locale() ) ],
         ];
 
-        $facets = $this->build_facets( $text );
-        if ( ! empty( $facets ) ) {
-            $record['facets'] = $facets;
-        }
-
         // ── Video takes priority over images (can't embed both) ───────────
         $video_embed = null;
         if ( $this->options->get( 'video_enabled', 1 ) ) {
@@ -54,8 +49,27 @@ class PostCreator {
                 $record['embed'] = [ '$type' => 'app.bsky.embed.images', 'images' => $images ];
                 $this->logger->info( count( $images ) . ' image(s) attached.', [ 'post_id' => $post->ID ] );
             } else {
-                $this->logger->debug( 'No media found for this post.', [ 'post_id' => $post->ID ] );
+                // No native media — ordinary web URLs may become one external card.
+                $primary_url = $this->find_primary_url( $text );
+                if ( $primary_url ) {
+                    $card = $this->build_external_embed( $primary_url, $jwt );
+                    if ( $card ) {
+                        $text = $this->remove_primary_url_from_text( $text, $primary_url );
+                        $record['text']  = $text;
+                        $record['embed'] = $card;
+                        $this->logger->info( 'External link card attached to Bluesky post.', [ 'post_id' => $post->ID, 'url' => $primary_url ] );
+                    }
+                }
+                if ( empty( $record['embed'] ) ) {
+                    $this->logger->debug( 'No media or external card found for this post.', [ 'post_id' => $post->ID ] );
+                }
             }
+        }
+
+        // Facets must be built from the final visible text after any card URL removal.
+        $facets = $this->build_facets( $record['text'] );
+        if ( ! empty( $facets ) ) {
+            $record['facets'] = $facets;
         }
 
         $host = rtrim( (string) $this->options->get( 'pds_host', 'https://bsky.social' ), '/' );
@@ -212,6 +226,136 @@ class PostCreator {
         if ( preg_match( '/<img[^>]+src=["\']' . $e . '["\'][^>]*alt=["\']([^"\']*)["\'][^>]*>/i', $content, $m ) ) return $m[1];
         if ( preg_match( '/<img[^>]+alt=["\']([^"\']*)["\'][^>]+src=["\']' . $e . '["\'][^>]*>/i', $content, $m ) ) return $m[1];
         return '';
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // EXTERNAL LINK CARDS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private function find_primary_url( string $text ): ?string {
+        if ( ! preg_match( '~https?://[^\s<>"\']+~iu', $text, $match ) ) return null;
+        $url = rtrim( $match[0], ".,!?;:)]}" );
+        return $this->is_safe_external_url( $url ) ? $url : null;
+    }
+
+    private function remove_primary_url_from_text( string $text, string $url ): string {
+        $pattern = '/' . preg_quote( $url, '/' ) . '/u';
+        $text = preg_replace( $pattern, '', $text, 1 );
+        $text = preg_replace( '/[ \t]{2,}/u', ' ', (string) $text );
+        $text = preg_replace( '/[ \t]+\n/u', "\n", (string) $text );
+        $text = preg_replace( '/\n[ \t]+/u', "\n", (string) $text );
+        $text = trim( preg_replace( '/\n{3,}/u', "\n\n", (string) $text ) );
+        return $text;
+    }
+
+    private function build_external_embed( string $url, string $jwt ): ?array {
+        $metadata = $this->fetch_external_metadata( $url );
+        if ( ! $metadata ) return null;
+
+        $external = [
+            'uri'         => $url,
+            'title'       => $metadata['title'],
+            'description' => $metadata['description'],
+        ];
+
+        if ( ! empty( $metadata['image'] ) ) {
+            $thumb = $this->uploader->upload_from_url( $metadata['image'], $jwt );
+            if ( ! is_wp_error( $thumb ) ) {
+                $external['thumb'] = $thumb;
+            } else {
+                $this->logger->debug( 'External card thumbnail upload failed; continuing without thumb.', [ 'url' => $metadata['image'] ] );
+            }
+        }
+
+        return [ '$type' => 'app.bsky.embed.external', 'external' => $external ];
+    }
+
+    private function fetch_external_metadata( string $url ): ?array {
+        if ( ! $this->is_safe_external_url( $url ) ) return null;
+
+        $response = wp_safe_remote_get( $url, [
+            'timeout'             => 12,
+            'redirection'         => 3,
+            'limit_response_size' => 1048576,
+            'user-agent'          => 'Crosspost to Bluesky/' . ( defined( 'CTB_VERSION' ) ? CTB_VERSION : 'unknown' ) . '; ' . home_url( '/' ),
+        ] );
+        if ( is_wp_error( $response ) ) {
+            $this->logger->debug( 'External card metadata fetch failed.', [ 'url' => $url, 'error' => $response->get_error_message() ] );
+            return null;
+        }
+
+        $code = wp_remote_retrieve_response_code( $response );
+        if ( $code < 200 || $code >= 300 ) return null;
+
+        $content_type = strtolower( (string) wp_remote_retrieve_header( $response, 'content-type' ) );
+        if ( $content_type && false === strpos( $content_type, 'text/html' ) && false === strpos( $content_type, 'application/xhtml+xml' ) ) return null;
+
+        $html = wp_remote_retrieve_body( $response );
+        if ( '' === trim( $html ) ) return null;
+
+        $title = $this->extract_meta_content( $html, 'property', 'og:title' )
+            ?: $this->extract_meta_content( $html, 'name', 'twitter:title' )
+            ?: $this->extract_html_title( $html );
+        $description = $this->extract_meta_content( $html, 'property', 'og:description' )
+            ?: $this->extract_meta_content( $html, 'name', 'twitter:description' )
+            ?: $this->extract_meta_content( $html, 'name', 'description' );
+        $image = $this->extract_meta_content( $html, 'property', 'og:image:secure_url' )
+            ?: $this->extract_meta_content( $html, 'property', 'og:image' )
+            ?: $this->extract_meta_content( $html, 'name', 'twitter:image' );
+
+        $title = $this->clean_card_text( $title ?: wp_parse_url( $url, PHP_URL_HOST ) ?: $url, 300 );
+        $description = $this->clean_card_text( $description ?: '', 1000 );
+        $image = $image ? $this->resolve_url( $image, $url ) : '';
+        if ( $image && ! $this->is_safe_external_url( $image ) ) $image = '';
+
+        return [ 'title' => $title, 'description' => $description, 'image' => $image ];
+    }
+
+    private function extract_meta_content( string $html, string $attribute, string $value ): string {
+        $attr = preg_quote( $attribute, '/' );
+        $val  = preg_quote( $value, '/' );
+        $patterns = [
+            '/<meta[^>]*\b' . $attr . '\s*=\s*(["\'])' . $val . '\1[^>]*\bcontent\s*=\s*(["\'])(.*?)\2[^>]*>/isu',
+            '/<meta[^>]*\bcontent\s*=\s*(["\'])(.*?)\1[^>]*\b' . $attr . '\s*=\s*(["\'])' . $val . '\3[^>]*>/isu',
+        ];
+        foreach ( $patterns as $i => $pattern ) {
+            if ( preg_match( $pattern, $html, $m ) ) {
+                return html_entity_decode( $i === 0 ? $m[3] : $m[2], ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+            }
+        }
+        return '';
+    }
+
+    private function extract_html_title( string $html ): string {
+        if ( preg_match( '/<title[^>]*>(.*?)<\/title>/isu', $html, $m ) ) {
+            return html_entity_decode( wp_strip_all_tags( $m[1] ), ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+        }
+        return '';
+    }
+
+    private function clean_card_text( string $text, int $max ): string {
+        $text = html_entity_decode( wp_strip_all_tags( $text ), ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+        $text = trim( preg_replace( '/\s+/u', ' ', $text ) );
+        return mb_substr( $text, 0, $max );
+    }
+
+    private function is_safe_external_url( string $url ): bool {
+        if ( ! wp_http_validate_url( $url ) ) return false;
+        $scheme = strtolower( (string) wp_parse_url( $url, PHP_URL_SCHEME ) );
+        return in_array( $scheme, [ 'http', 'https' ], true );
+    }
+
+    private function resolve_url( string $candidate, string $base ): string {
+        $candidate = trim( html_entity_decode( $candidate, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) );
+        if ( preg_match( '~^https?://~i', $candidate ) ) return $candidate;
+        $parts = wp_parse_url( $base );
+        if ( empty( $parts['scheme'] ) || empty( $parts['host'] ) ) return '';
+        if ( str_starts_with( $candidate, '//' ) ) return $parts['scheme'] . ':' . $candidate;
+        $origin = $parts['scheme'] . '://' . $parts['host'] . ( isset( $parts['port'] ) ? ':' . $parts['port'] : '' );
+        if ( str_starts_with( $candidate, '/' ) ) return $origin . $candidate;
+        $path = $parts['path'] ?? '/';
+        $dir = preg_replace( '~/[^/]*$~', '/', $path );
+        return $origin . $dir . $candidate;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
