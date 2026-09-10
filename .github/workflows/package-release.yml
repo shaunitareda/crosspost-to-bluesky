@@ -1,0 +1,78 @@
+name: Package Crosspost to Bluesky
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-and-package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+
+      - name: Verify PHP syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            php -l "$file"
+          done < <(find . -type f -name '*.php' -print0)
+
+      - name: Read and verify plugin version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          HEADER_VERSION="$(sed -nE 's/^ \* Version:[[:space:]]*([^[:space:]]+).*/\1/p' crosspost-to-bluesky.php | head -n1)"
+          CONST_VERSION="$(sed -nE "s/^define\( 'CTB_VERSION',[[:space:]]*'([^']+)' \);/\1/p" crosspost-to-bluesky.php | head -n1)"
+          test -n "$HEADER_VERSION"
+          test "$HEADER_VERSION" = "$CONST_VERSION"
+          echo "version=$HEADER_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Verified plugin version $HEADER_VERSION"
+
+      - name: Build canonical plugin ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build
+          mkdir -p build/crosspost-to-bluesky
+          rsync -a ./ build/crosspost-to-bluesky/ \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='build/' \
+            --exclude='crosspost-to-bluesky.zip'
+          cd build
+          zip -qr ../crosspost-to-bluesky.zip crosspost-to-bluesky
+
+      - name: Verify packaged ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/ctb-package-check
+          mkdir -p /tmp/ctb-package-check
+          unzip -q crosspost-to-bluesky.zip -d /tmp/ctb-package-check
+          test -f /tmp/ctb-package-check/crosspost-to-bluesky/crosspost-to-bluesky.php
+          test -f /tmp/ctb-package-check/crosspost-to-bluesky/includes/Api/PostCreator.php
+          grep -F "Version:           ${{ steps.version.outputs.version }}" /tmp/ctb-package-check/crosspost-to-bluesky/crosspost-to-bluesky.php
+          grep -F "strip_leading_duplicate_title" /tmp/ctb-package-check/crosspost-to-bluesky/includes/Api/PostCreator.php
+          sha256sum crosspost-to-bluesky.zip
+
+      - name: Upload canonical package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crosspost-to-bluesky-${{ steps.version.outputs.version }}
+          path: crosspost-to-bluesky.zip
+          if-no-files-found: error
+          retention-days: 30
