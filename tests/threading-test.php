@@ -3,14 +3,6 @@
  * Lightweight regression tests for PostCreator threading helpers.
  * Run: php tests/threading-test.php
  */
-
-$source = file_get_contents( __DIR__ . '/../includes/Api/PostCreator.php' );
-if ( false === $source ) {
-    fwrite( STDERR, "Unable to read PostCreator.php\n" );
-    exit( 1 );
-}
-
-// Load PostCreator without WordPress by stubbing constructor type dependencies.
 namespace CTB\Api {
     class Auth {}
     class ImageUploader {}
