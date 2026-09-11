@@ -5,6 +5,7 @@ use CTB\Core\Logger;
 
 class PostCreator {
     private const MAX_IMAGES = 4;
+    private const MAX_POST_CHARS = 300;
     private const VIDEO_MIMES = [ 'video/mp4', 'video/mpeg', 'video/quicktime', 'video/x-msvideo', 'video/webm' ];
 
     public function __construct(
@@ -26,12 +27,7 @@ class PostCreator {
         $text = $this->build_text( $post );
         if ( '' === $text ) return new \WP_Error( 'ctb_empty', 'Post text is empty after processing.' );
 
-        $record = [
-            '$type'     => 'app.bsky.feed.post',
-            'text'      => $text,
-            'createdAt' => gmdate( 'c' ),
-            'langs'     => [ $this->locale_to_lang( get_locale() ) ],
-        ];
+        $embed = null;
 
         // ── Video takes priority over images (can't embed both) ───────────
         $video_embed = null;
@@ -40,13 +36,13 @@ class PostCreator {
         }
 
         if ( $video_embed ) {
-            $record['embed'] = $video_embed;
+            $embed = $video_embed;
             $this->logger->info( 'Video embed attached to Bluesky post.', [ 'post_id' => $post->ID ] );
         } else {
             // No video — try images
             $images = $this->collect_images( $post, $jwt );
             if ( ! empty( $images ) ) {
-                $record['embed'] = [ '$type' => 'app.bsky.embed.images', 'images' => $images ];
+                $embed = [ '$type' => 'app.bsky.embed.images', 'images' => $images ];
                 $this->logger->info( count( $images ) . ' image(s) attached.', [ 'post_id' => $post->ID ] );
             } else {
                 // No native media — ordinary web URLs may become one external card.
@@ -55,29 +51,78 @@ class PostCreator {
                     $card = $this->build_external_embed( $primary_url, $jwt );
                     if ( $card ) {
                         $text = $this->remove_primary_url_from_text( $text, $primary_url );
-                        $record['text']  = $text;
-                        $record['embed'] = $card;
+                        $embed = $card;
                         $this->logger->info( 'External link card attached to Bluesky post.', [ 'post_id' => $post->ID, 'url' => $primary_url ] );
                     }
                 }
-                if ( empty( $record['embed'] ) ) {
+                if ( ! $embed ) {
                     $this->logger->debug( 'No media or external card found for this post.', [ 'post_id' => $post->ID ] );
                 }
             }
         }
 
-        // Facets must be built from the final visible text after any card URL removal.
-        $facets = $this->build_facets( $record['text'] );
-        if ( ! empty( $facets ) ) {
-            $record['facets'] = $facets;
-        }
+        $chunks = $this->split_text_for_thread( $text );
+        if ( empty( $chunks ) ) return new \WP_Error( 'ctb_empty', 'Post text is empty after processing.' );
 
         $host = rtrim( (string) $this->options->get( 'pds_host', 'https://bsky.social' ), '/' );
-        return $this->http->post_json(
-            $host . '/xrpc/com.atproto.repo.createRecord',
-            [ 'repo' => $did, 'collection' => 'app.bsky.feed.post', 'record' => $record ],
-            [ 'Authorization' => 'Bearer ' . $jwt ]
-        );
+        $endpoint = $host . '/xrpc/com.atproto.repo.createRecord';
+        $root_ref = null;
+        $parent_ref = null;
+        $last_response = null;
+
+        foreach ( $chunks as $index => $chunk ) {
+            $record = [
+                '$type'     => 'app.bsky.feed.post',
+                'text'      => $chunk,
+                'createdAt' => gmdate( 'c' ),
+                'langs'     => [ $this->locale_to_lang( get_locale() ) ],
+            ];
+
+            if ( 0 === $index && $embed ) {
+                $record['embed'] = $embed;
+            }
+
+            $facets = $this->build_facets( $chunk );
+            if ( ! empty( $facets ) ) {
+                $record['facets'] = $facets;
+            }
+
+            if ( $parent_ref ) {
+                $record['reply'] = [
+                    'root'   => $root_ref,
+                    'parent' => $parent_ref,
+                ];
+            }
+
+            $response = $this->http->post_json(
+                $endpoint,
+                [ 'repo' => $did, 'collection' => 'app.bsky.feed.post', 'record' => $record ],
+                [ 'Authorization' => 'Bearer ' . $jwt ]
+            );
+            if ( is_wp_error( $response ) ) return $response;
+
+            $ref = $this->record_ref_from_response( $response );
+            if ( ! $ref ) {
+                return new \WP_Error( 'ctb_bad_record_response', 'Bluesky did not return a record URI/CID for thread chaining.' );
+            }
+
+            if ( null === $root_ref ) $root_ref = $ref;
+            $parent_ref = $ref;
+            $last_response = $response;
+        }
+
+        if ( count( $chunks ) > 1 ) {
+            $this->logger->info( 'Bluesky thread created.', [ 'post_id' => $post->ID, 'chunks' => count( $chunks ) ] );
+        }
+
+        return $last_response;
+    }
+
+    private function record_ref_from_response( array $response ): ?array {
+        $uri = $response['uri'] ?? '';
+        $cid = $response['cid'] ?? '';
+        if ( ! is_string( $uri ) || ! is_string( $cid ) || '' === $uri || '' === $cid ) return null;
+        return [ 'uri' => $uri, 'cid' => $cid ];
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -152,9 +197,7 @@ class PostCreator {
     }
 
     private function extract_video_url( string $content ): ?string {
-        // <video src="...">
         if ( preg_match( '/<video[^>]+src=["\']([^"\']+\.mp4[^"\']*)["\'][^>]*>/i', $content, $m ) ) return $m[1];
-        // <source src="..." type="video/...">
         if ( preg_match( '/<source[^>]+src=["\']([^"\']+\.mp4[^"\']*)["\'][^>]*>/i', $content, $m ) ) return $m[1];
         if ( preg_match( '/<source[^>]+src=["\']([^"\']+)["\'][^>]+type=["\']video\/[^"\']+["\'][^>]*>/i', $content, $m ) ) return $m[1];
         return null;
@@ -166,8 +209,6 @@ class PostCreator {
 
     private function collect_images( \WP_Post $post, string $jwt ): array {
         $blobs = []; $seen_ids = [];
-
-        // Tier 1: Featured image (skip if it's a video)
         $thumb_id = get_post_thumbnail_id( $post->ID );
         if ( $thumb_id ) {
             $thumb_mime = get_post_mime_type( $thumb_id );
@@ -178,8 +219,6 @@ class PostCreator {
                 else $this->logger->error( 'Tier 1 failed: ' . $blob->get_error_message(), [ 'id' => $thumb_id ] );
             }
         }
-
-        // Tier 2: WP image attachments (Social Notes / Enable Mastodon Apps)
         if ( count( $blobs ) < self::MAX_IMAGES ) {
             $attached = get_attached_media( 'image', $post );
             $this->logger->debug( 'Tier 2: attached images.', [ 'count' => count( $attached ) ] );
@@ -191,8 +230,6 @@ class PostCreator {
                 else $this->logger->error( 'Tier 2 failed: ' . $blob->get_error_message(), [ 'id' => $att->ID ] );
             }
         }
-
-        // Tier 3: <img> scrape from content
         if ( count( $blobs ) < self::MAX_IMAGES && ! empty( $post->post_content ) ) {
             $urls = $this->extract_img_urls( $post->post_content );
             $this->logger->debug( 'Tier 3: img URLs in content.', [ 'count' => count( $urls ) ] );
@@ -251,85 +288,44 @@ class PostCreator {
     private function build_external_embed( string $url, string $jwt ): ?array {
         $metadata = $this->fetch_external_metadata( $url );
         if ( ! $metadata ) return null;
-
-        $external = [
-            'uri'         => $url,
-            'title'       => $metadata['title'],
-            'description' => $metadata['description'],
-        ];
-
+        $external = [ 'uri' => $url, 'title' => $metadata['title'], 'description' => $metadata['description'] ];
         if ( ! empty( $metadata['image'] ) ) {
             $thumb = $this->uploader->upload_from_url( $metadata['image'], $jwt );
-            if ( ! is_wp_error( $thumb ) ) {
-                $external['thumb'] = $thumb;
-            } else {
-                $this->logger->debug( 'External card thumbnail upload failed; continuing without thumb.', [ 'url' => $metadata['image'] ] );
-            }
+            if ( ! is_wp_error( $thumb ) ) $external['thumb'] = $thumb;
+            else $this->logger->debug( 'External card thumbnail upload failed; continuing without thumb.', [ 'url' => $metadata['image'] ] );
         }
-
         return [ '$type' => 'app.bsky.embed.external', 'external' => $external ];
     }
 
     private function fetch_external_metadata( string $url ): ?array {
         if ( ! $this->is_safe_external_url( $url ) ) return null;
-
-        $response = wp_safe_remote_get( $url, [
-            'timeout'             => 12,
-            'redirection'         => 3,
-            'limit_response_size' => 1048576,
-            'user-agent'          => 'Crosspost to Bluesky/' . ( defined( 'CTB_VERSION' ) ? CTB_VERSION : 'unknown' ) . '; ' . home_url( '/' ),
-        ] );
-        if ( is_wp_error( $response ) ) {
-            $this->logger->debug( 'External card metadata fetch failed.', [ 'url' => $url, 'error' => $response->get_error_message() ] );
-            return null;
-        }
-
+        $response = wp_safe_remote_get( $url, [ 'timeout' => 12, 'redirection' => 3, 'limit_response_size' => 1048576, 'user-agent' => 'Crosspost to Bluesky/' . ( defined( 'CTB_VERSION' ) ? CTB_VERSION : 'unknown' ) . '; ' . home_url( '/' ) ] );
+        if ( is_wp_error( $response ) ) { $this->logger->debug( 'External card metadata fetch failed.', [ 'url' => $url, 'error' => $response->get_error_message() ] ); return null; }
         $code = wp_remote_retrieve_response_code( $response );
         if ( $code < 200 || $code >= 300 ) return null;
-
         $content_type = strtolower( (string) wp_remote_retrieve_header( $response, 'content-type' ) );
         if ( $content_type && false === strpos( $content_type, 'text/html' ) && false === strpos( $content_type, 'application/xhtml+xml' ) ) return null;
-
         $html = wp_remote_retrieve_body( $response );
         if ( '' === trim( $html ) ) return null;
-
-        $title = $this->extract_meta_content( $html, 'property', 'og:title' )
-            ?: $this->extract_meta_content( $html, 'name', 'twitter:title' )
-            ?: $this->extract_html_title( $html );
-        $description = $this->extract_meta_content( $html, 'property', 'og:description' )
-            ?: $this->extract_meta_content( $html, 'name', 'twitter:description' )
-            ?: $this->extract_meta_content( $html, 'name', 'description' );
-        $image = $this->extract_meta_content( $html, 'property', 'og:image:secure_url' )
-            ?: $this->extract_meta_content( $html, 'property', 'og:image' )
-            ?: $this->extract_meta_content( $html, 'name', 'twitter:image' );
-
+        $title = $this->extract_meta_content( $html, 'property', 'og:title' ) ?: $this->extract_meta_content( $html, 'name', 'twitter:title' ) ?: $this->extract_html_title( $html );
+        $description = $this->extract_meta_content( $html, 'property', 'og:description' ) ?: $this->extract_meta_content( $html, 'name', 'twitter:description' ) ?: $this->extract_meta_content( $html, 'name', 'description' );
+        $image = $this->extract_meta_content( $html, 'property', 'og:image:secure_url' ) ?: $this->extract_meta_content( $html, 'property', 'og:image' ) ?: $this->extract_meta_content( $html, 'name', 'twitter:image' );
         $title = $this->clean_card_text( $title ?: wp_parse_url( $url, PHP_URL_HOST ) ?: $url, 300 );
         $description = $this->clean_card_text( $description ?: '', 1000 );
         $image = $image ? $this->resolve_url( $image, $url ) : '';
         if ( $image && ! $this->is_safe_external_url( $image ) ) $image = '';
-
         return [ 'title' => $title, 'description' => $description, 'image' => $image ];
     }
 
     private function extract_meta_content( string $html, string $attribute, string $value ): string {
-        $attr = preg_quote( $attribute, '/' );
-        $val  = preg_quote( $value, '/' );
-        $patterns = [
-            '/<meta[^>]*\b' . $attr . '\s*=\s*(["\'])' . $val . '\1[^>]*\bcontent\s*=\s*(["\'])(.*?)\2[^>]*>/isu',
-            '/<meta[^>]*\bcontent\s*=\s*(["\'])(.*?)\1[^>]*\b' . $attr . '\s*=\s*(["\'])' . $val . '\3[^>]*>/isu',
-        ];
-        foreach ( $patterns as $i => $pattern ) {
-            if ( preg_match( $pattern, $html, $m ) ) {
-                return html_entity_decode( $i === 0 ? $m[3] : $m[2], ENT_QUOTES | ENT_HTML5, 'UTF-8' );
-            }
-        }
+        $attr = preg_quote( $attribute, '/' ); $val = preg_quote( $value, '/' );
+        $patterns = [ '/<meta[^>]*\b' . $attr . '\s*=\s*(["\'])' . $val . '\1[^>]*\bcontent\s*=\s*(["\'])(.*?)\2[^>]*>/isu', '/<meta[^>]*\bcontent\s*=\s*(["\'])(.*?)\1[^>]*\b' . $attr . '\s*=\s*(["\'])' . $val . '\3[^>]*>/isu' ];
+        foreach ( $patterns as $i => $pattern ) if ( preg_match( $pattern, $html, $m ) ) return html_entity_decode( $i === 0 ? $m[3] : $m[2], ENT_QUOTES | ENT_HTML5, 'UTF-8' );
         return '';
     }
 
     private function extract_html_title( string $html ): string {
-        if ( preg_match( '/<title[^>]*>(.*?)<\/title>/isu', $html, $m ) ) {
-            return html_entity_decode( wp_strip_all_tags( $m[1] ), ENT_QUOTES | ENT_HTML5, 'UTF-8' );
-        }
+        if ( preg_match( '/<title[^>]*>(.*?)<\/title>/isu', $html, $m ) ) return html_entity_decode( wp_strip_all_tags( $m[1] ), ENT_QUOTES | ENT_HTML5, 'UTF-8' );
         return '';
     }
 
@@ -359,46 +355,81 @@ class PostCreator {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // TEXT / FACETS
+    // TEXT / THREADING / FACETS
     // ─────────────────────────────────────────────────────────────────────────
 
     private function build_text( \WP_Post $post ): string {
         $template  = (string) $this->options->get( 'template', "{title}\n{content}" );
         $title     = wp_strip_all_tags( html_entity_decode( get_the_title( $post ), ENT_QUOTES, 'UTF-8' ) );
         $raw       = wp_strip_all_tags( strip_shortcodes( $post->post_content ) );
-        $excerpt   = has_excerpt( $post )
-            ? wp_strip_all_tags( html_entity_decode( $post->post_excerpt, ENT_QUOTES, 'UTF-8' ) )
-            : wp_trim_words( $raw, 55, '...' );
-        $content   = wp_trim_words( $raw, 100, '...' );
+        $excerpt   = has_excerpt( $post ) ? wp_strip_all_tags( html_entity_decode( $post->post_excerpt, ENT_QUOTES, 'UTF-8' ) ) : wp_trim_words( $raw, 55, '...' );
+        $content   = $raw;
         $permalink = get_permalink( $post );
         $is_note   = ( ! $title || 'post-format-status' === get_post_format( $post ) || $post->post_type === 'indieblocks_note' );
         if ( $is_note ) $template = preg_replace( '/^\{title\}\s*/m', '', $template );
-
-        // Bluesky has no title/body distinction. Treat WordPress titles as a
-        // leading fragment of the same post rather than forcing a paragraph break.
-        // This is Bluesky-only formatting; the WordPress post itself is untouched.
-        if ( false !== strpos( $template, '{title}' ) && false !== strpos( $template, '{content}' ) ) {
-            $template = preg_replace( '/\{title\}\s*\R+\s*\{content\}/u', '{title} {content}', $template );
-        }
-
-        // Avoid awkward title/body duplication while preserving custom templates.
-        // If content starts with the post title, remove only that leading copy and
-        // keep the rest of the body intact. Matching tolerates whitespace and
-        // sentence-ending punctuation differences (for example "Memo" vs "Memo.").
-        if (
-            false !== strpos( $template, '{title}' ) &&
-            false !== strpos( $template, '{content}' ) &&
-            '' !== $title
-        ) {
-            $content = $this->strip_leading_duplicate_title( $title, $content );
-        }
-
+        if ( false !== strpos( $template, '{title}' ) && false !== strpos( $template, '{content}' ) ) $template = preg_replace( '/\{title\}\s*\R+\s*\{content\}/u', '{title} {content}', $template );
+        if ( false !== strpos( $template, '{title}' ) && false !== strpos( $template, '{content}' ) && '' !== $title ) $content = $this->strip_leading_duplicate_title( $title, $content );
         $text = strtr( $template, [ '{title}' => $title, '{excerpt}' => $excerpt, '{content}' => $content, '{url}' => $permalink ] );
         if ( $this->options->get( 'include_permalink', 0 ) ) $text .= "\n\n" . $permalink;
         $text = trim( preg_replace( '/\n{3,}/', "\n\n", $text ) );
-        if ( mb_strlen( $text ) > 300 ) $text = mb_substr( $text, 0, 297 ) . '...';
         $this->logger->debug( 'Built text.', [ 'text' => $text ] );
         return $text;
+    }
+
+    private function split_text_for_thread( string $text ): array {
+        $chunks = [];
+        $remaining = trim( $text );
+        while ( '' !== $remaining ) {
+            if ( mb_strlen( $remaining ) <= self::MAX_POST_CHARS ) { $chunks[] = $remaining; break; }
+            $candidate = mb_substr( $remaining, 0, self::MAX_POST_CHARS );
+            $split = $this->find_split_position( $candidate, $remaining );
+            if ( $split < 1 ) $split = self::MAX_POST_CHARS;
+            $chunk = rtrim( mb_substr( $remaining, 0, $split ) );
+            if ( '' === $chunk ) { $chunk = mb_substr( $remaining, 0, self::MAX_POST_CHARS ); $split = self::MAX_POST_CHARS; }
+            $chunks[] = $chunk;
+            $remaining = ltrim( mb_substr( $remaining, $split ) );
+        }
+        return $chunks;
+    }
+
+    private function find_split_position( string $candidate, string $remaining ): int {
+        $limit = mb_strlen( $candidate );
+        $url_ranges = $this->url_char_ranges( $remaining );
+        $best = 0;
+        if ( preg_match_all( '/\n{2,}|\n/u', $candidate, $m, PREG_OFFSET_CAPTURE ) ) {
+            foreach ( $m[0] as [ $match, $byte ] ) { $pos = mb_strlen( substr( $candidate, 0, $byte ) ) + mb_strlen( $match ); if ( $pos < $limit && ! $this->char_position_inside_ranges( $pos, $url_ranges ) ) $best = $pos; }
+        }
+        if ( $best > 0 ) return $best;
+        if ( preg_match_all( '/[.!?。！？](?:["\'”’\)\]]*)\s+/u', $candidate, $m, PREG_OFFSET_CAPTURE ) ) {
+            foreach ( $m[0] as [ $match, $byte ] ) { $pos = mb_strlen( substr( $candidate, 0, $byte ) ) + mb_strlen( $match ); if ( $pos < $limit && ! $this->char_position_inside_ranges( $pos, $url_ranges ) ) $best = $pos; }
+        }
+        if ( $best > 0 ) return $best;
+        if ( preg_match_all( '/\s+/u', $candidate, $m, PREG_OFFSET_CAPTURE ) ) {
+            foreach ( $m[0] as [ $match, $byte ] ) { $pos = mb_strlen( substr( $candidate, 0, $byte ) ); if ( $pos > 0 && $pos < $limit && ! $this->char_position_inside_ranges( $pos, $url_ranges ) ) $best = $pos; }
+        }
+        if ( $best > 0 ) return $best;
+        foreach ( $url_ranges as [ $start, $end ] ) {
+            if ( $start < $limit && $end > $limit && $start > 0 ) return $start;
+        }
+        return $limit;
+    }
+
+    private function url_char_ranges( string $text ): array {
+        $ranges = [];
+        if ( preg_match_all( '~https?://[^\s<>"\']+~iu', $text, $matches, PREG_OFFSET_CAPTURE ) ) {
+            foreach ( $matches[0] as [ $raw_url, $byte_start ] ) {
+                $url = rtrim( $raw_url, ".,!?;:)]}" );
+                if ( '' === $url ) continue;
+                $char_start = mb_strlen( substr( $text, 0, $byte_start ) );
+                $ranges[] = [ $char_start, $char_start + mb_strlen( $url ) ];
+            }
+        }
+        return $ranges;
+    }
+
+    private function char_position_inside_ranges( int $position, array $ranges ): bool {
+        foreach ( $ranges as [ $start, $end ] ) if ( $position > $start && $position < $end ) return true;
+        return false;
     }
 
     private function normalize_for_compare( string $text ): string {
@@ -411,74 +442,39 @@ class PostCreator {
     private function strip_leading_duplicate_title( string $title, string $content ): string {
         $normalized_title = $this->normalize_for_compare( $title );
         if ( '' === $normalized_title || '' === trim( $content ) ) return $content;
-
         $parts = preg_split( '/\s+/u', $normalized_title, -1, PREG_SPLIT_NO_EMPTY );
         if ( empty( $parts ) ) return $content;
-
-        $pattern = implode( '\\s+', array_map(
-            static fn( string $part ): string => preg_quote( $part, '/' ),
-            $parts
-        ) );
-
-        $deduped = preg_replace(
-            '/^\s*' . $pattern . '(?:[.!?。！？]+)?(?=\s|$)\s*/iu',
-            '',
-            $content,
-            1,
-            $count
-        );
-
+        $pattern = implode( '\\s+', array_map( static fn( string $part ): string => preg_quote( $part, '/' ), $parts ) );
+        $deduped = preg_replace( '/^\s*' . $pattern . '(?:[.!?。！？]+)?(?=\s|$)\s*/iu', '', $content, 1, $count );
         return $count > 0 ? trim( (string) $deduped ) : $content;
     }
 
-    /**
-     * Build AT Protocol rich-text facets from the final post text.
-     * PREG_OFFSET_CAPTURE returns byte offsets, which is exactly what ATProto expects.
-     */
     private function build_facets( string $text ): array {
-        $facets = [];
-        $link_ranges = [];
-
+        $facets = []; $link_ranges = [];
         if ( preg_match_all( '~https?://[^\s<>"\']+~iu', $text, $matches, PREG_OFFSET_CAPTURE ) ) {
             foreach ( $matches[0] as [ $raw_url, $start ] ) {
                 $url = rtrim( $raw_url, ".,!?;:)]}" );
                 if ( '' === $url ) continue;
                 $end = $start + strlen( $url );
                 $link_ranges[] = [ $start, $end ];
-                $facets[] = [
-                    'index' => [ 'byteStart' => $start, 'byteEnd' => $end ],
-                    'features' => [
-                        [ '$type' => 'app.bsky.richtext.facet#link', 'uri' => $url ],
-                    ],
-                ];
+                $facets[] = [ 'index' => [ 'byteStart' => $start, 'byteEnd' => $end ], 'features' => [ [ '$type' => 'app.bsky.richtext.facet#link', 'uri' => $url ] ] ];
             }
         }
-
         if ( preg_match_all( '/(?<![\p{L}\p{M}\p{N}_])#([\p{L}\p{M}\p{N}_]+)/u', $text, $matches, PREG_OFFSET_CAPTURE ) ) {
             foreach ( $matches[0] as $i => [ $full, $start ] ) {
                 $end = $start + strlen( $full );
                 if ( $this->range_overlaps( $start, $end, $link_ranges ) ) continue;
-
                 $tag = $matches[1][ $i ][0] ?? '';
                 if ( '' === $tag ) continue;
-
-                $facets[] = [
-                    'index' => [ 'byteStart' => $start, 'byteEnd' => $end ],
-                    'features' => [
-                        [ '$type' => 'app.bsky.richtext.facet#tag', 'tag' => $tag ],
-                    ],
-                ];
+                $facets[] = [ 'index' => [ 'byteStart' => $start, 'byteEnd' => $end ], 'features' => [ [ '$type' => 'app.bsky.richtext.facet#tag', 'tag' => $tag ] ] ];
             }
         }
-
         usort( $facets, fn( array $a, array $b ): int => $a['index']['byteStart'] <=> $b['index']['byteStart'] );
         return $facets;
     }
 
     private function range_overlaps( int $start, int $end, array $ranges ): bool {
-        foreach ( $ranges as [ $range_start, $range_end ] ) {
-            if ( $start < $range_end && $end > $range_start ) return true;
-        }
+        foreach ( $ranges as [ $range_start, $range_end ] ) if ( $start < $range_end && $end > $range_start ) return true;
         return false;
     }
 
