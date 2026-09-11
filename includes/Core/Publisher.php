@@ -37,7 +37,8 @@ class Publisher {
         }
         if ( get_post_meta( $post->ID, '_ctb_skip_crosspost', true ) ) { $this->logger->debug( 'Skipped: manual skip flag.', [ 'post_id' => $post->ID ] ); return; }
 
-        $blacksky_only = (bool) get_post_meta( $post->ID, '_ctb_blacksky_only', true );
+        $blacksky_only = (bool) get_post_meta( $post->ID, '_ctb_blacksky_only', true )
+            || $this->has_blacksky_route_command( $post );
         $published_uri_meta = $blacksky_only ? '_ctb_blacksky_uri' : '_ctb_bluesky_uri';
         $published_cid_meta = $blacksky_only ? '_ctb_blacksky_cid' : '_ctb_bluesky_cid';
 
@@ -74,5 +75,21 @@ class Publisher {
             $blacksky_only ? 'Blacksky-only crosspost succeeded.' : 'Crosspost succeeded.',
             [ 'post_id' => $post->ID, 'uri' => $result['uri'] ?? '' ]
         );
+    }
+
+    private function has_blacksky_route_command( \WP_Post $post ): bool {
+        $text = implode(
+            "\n",
+            [
+                (string) $post->post_title,
+                (string) $post->post_excerpt,
+                (string) $post->post_content,
+            ]
+        );
+
+        return preg_match(
+            '/(?<![\\p{L}\\p{M}\\p{N}_])#blacksky(?![\\p{L}\\p{M}\\p{N}_])/iu',
+            $text
+        ) === 1;
     }
 }

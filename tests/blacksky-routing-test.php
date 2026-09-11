@@ -45,7 +45,9 @@ namespace {
     $assert( str_contains( $creator_source, "'collection' => 'community.blacksky.feed.post'" ), 'Blacksky stub collection is present' );
     $assert( str_contains( $creator_source, '/xrpc/community.blacksky.feed.deletePost' ), 'Blacksky cleanup endpoint is present' );
     $assert( str_contains( $creator_source, "'uri' => $submitted_uri" ), 'Thread chaining returns the AppView canonical URI' );
-    $assert( str_contains( $publisher_source, "'_ctb_blacksky_only'" ), 'Publisher recognizes Blacksky-only routing' );
+    $assert( str_contains( $publisher_source, "'_ctb_blacksky_only'" ), 'Publisher recognizes Blacksky-only routing meta' );
+    $assert( str_contains( $publisher_source, 'has_blacksky_route_command' ), 'Publisher recognizes #blacksky routing command' );
+    $assert( str_contains( $creator_source, 'strip_blacksky_route_command' ), 'Outgoing Blacksky text strips the routing command' );
     $assert(
         str_contains( $publisher_source, "'_ctb_blacksky_uri'" ) && str_contains( $publisher_source, "'_ctb_blacksky_cid'" ),
         'Blacksky publication metadata is isolated'

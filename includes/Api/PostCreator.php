@@ -26,6 +26,9 @@ class PostCreator {
         if ( ! $jwt || ! $did ) return new \WP_Error( 'ctb_bad_session', 'Invalid Bluesky session response.' );
 
         $text = $this->build_text( $post );
+        if ( $blacksky_only ) {
+            $text = $this->strip_blacksky_route_command( $text );
+        }
         if ( '' === $text ) return new \WP_Error( 'ctb_empty', 'Post text is empty after processing.' );
 
         $embed = null;
@@ -495,6 +498,18 @@ class PostCreator {
         $text = trim( preg_replace( '/\n{3,}/', "\n\n", $text ) );
         $this->logger->debug( 'Built text.', [ 'text' => $text ] );
         return $text;
+    }
+
+    private function strip_blacksky_route_command( string $text ): string {
+        $text = preg_replace(
+            '/(?<![\\p{L}\\p{M}\\p{N}_])#blacksky(?![\\p{L}\\p{M}\\p{N}_])/iu',
+            '',
+            $text
+        );
+        $text = preg_replace( '/[ \t]{2,}/u', ' ', (string) $text );
+        $text = preg_replace( '/[ \t]+\n/u', "\n", (string) $text );
+        $text = preg_replace( '/\n[ \t]+/u', "\n", (string) $text );
+        return trim( preg_replace( '/\n{3,}/u', "\n\n", (string) $text ) );
     }
 
     private function split_text_for_thread( string $text ): array {
