@@ -31,6 +31,10 @@ jobs:
             php -l "$file"
           done < <(find . -type f -name '*.php' -print0)
 
+      - name: Run threading regression tests
+        shell: bash
+        run: php tests/threading-test.php
+
       - name: Read and verify plugin version
         id: version
         shell: bash
