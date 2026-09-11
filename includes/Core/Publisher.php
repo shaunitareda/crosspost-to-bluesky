@@ -36,21 +36,43 @@ class Publisher {
             return;
         }
         if ( get_post_meta( $post->ID, '_ctb_skip_crosspost', true ) ) { $this->logger->debug( 'Skipped: manual skip flag.', [ 'post_id' => $post->ID ] ); return; }
-        if ( get_post_meta( $post->ID, '_ctb_bluesky_uri', true ) )     { $this->logger->debug( 'Skipped: already crossposted.', [ 'post_id' => $post->ID ] ); return; }
+
+        $blacksky_only = (bool) get_post_meta( $post->ID, '_ctb_blacksky_only', true );
+        $published_uri_meta = $blacksky_only ? '_ctb_blacksky_uri' : '_ctb_bluesky_uri';
+        $published_cid_meta = $blacksky_only ? '_ctb_blacksky_cid' : '_ctb_bluesky_cid';
+
+        if ( get_post_meta( $post->ID, $published_uri_meta, true ) ) {
+            $this->logger->debug(
+                $blacksky_only ? 'Skipped: already crossposted to Blacksky community.' : 'Skipped: already crossposted.',
+                [ 'post_id' => $post->ID ]
+            );
+            return;
+        }
+
         if ( get_post_meta( $post->ID, '_ctb_crosspost_in_progress', true ) ) { $this->logger->debug( 'Skipped: crosspost already in progress.', [ 'post_id' => $post->ID ] ); return; }
         update_post_meta( $post->ID, '_ctb_crosspost_in_progress', 1 );
-        $this->logger->info( 'Starting crosspost.', [ 'post_id' => $post->ID, 'post_type' => $post->post_type ] );
-        $result = $this->creator->create_from_post( $post );
+
+        $this->logger->info(
+            $blacksky_only ? 'Starting Blacksky-only crosspost.' : 'Starting crosspost.',
+            [ 'post_id' => $post->ID, 'post_type' => $post->post_type ]
+        );
+
+        $result = $this->creator->create_from_post( $post, $blacksky_only );
         if ( is_wp_error( $result ) ) {
             update_post_meta( $post->ID, '_ctb_last_error', $result->get_error_message() );
             delete_post_meta( $post->ID, '_ctb_crosspost_in_progress' );
             $this->logger->error( 'Crosspost failed: ' . $result->get_error_message(), [ 'post_id' => $post->ID ] );
             return;
         }
-        update_post_meta( $post->ID, '_ctb_bluesky_uri', $result['uri'] ?? '' );
-        update_post_meta( $post->ID, '_ctb_bluesky_cid', $result['cid'] ?? '' );
+
+        update_post_meta( $post->ID, $published_uri_meta, $result['uri'] ?? '' );
+        update_post_meta( $post->ID, $published_cid_meta, $result['cid'] ?? '' );
         delete_post_meta( $post->ID, '_ctb_last_error' );
         delete_post_meta( $post->ID, '_ctb_crosspost_in_progress' );
-        $this->logger->info( 'Crosspost succeeded.', [ 'post_id' => $post->ID, 'uri' => $result['uri'] ?? '' ] );
+
+        $this->logger->info(
+            $blacksky_only ? 'Blacksky-only crosspost succeeded.' : 'Crosspost succeeded.',
+            [ 'post_id' => $post->ID, 'uri' => $result['uri'] ?? '' ]
+        );
     }
 }

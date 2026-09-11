@@ -7,6 +7,7 @@ class PostCreator {
     private const MAX_IMAGES = 4;
     private const MAX_POST_CHARS = 300;
     private const VIDEO_MIMES = [ 'video/mp4', 'video/mpeg', 'video/quicktime', 'video/x-msvideo', 'video/webm' ];
+    private const BLACKSKY_APPVIEW_PROXY = 'did:web:api.blacksky.community#bsky_appview';
 
     public function __construct(
         private Auth          $auth,
@@ -17,7 +18,7 @@ class PostCreator {
         private Logger        $logger
     ) {}
 
-    public function create_from_post( \WP_Post $post ) {
+    public function create_from_post( \WP_Post $post, bool $blacksky_only = false ) {
         $session = $this->auth->create_session();
         if ( is_wp_error( $session ) ) return $session;
         $jwt = $session['accessJwt'] ?? '';
@@ -94,11 +95,21 @@ class PostCreator {
                 ];
             }
 
-            $response = $this->http->post_json(
-                $endpoint,
-                [ 'repo' => $did, 'collection' => 'app.bsky.feed.post', 'record' => $record ],
-                [ 'Authorization' => 'Bearer ' . $jwt ]
-            );
+            if ( $blacksky_only ) {
+                $response = $this->create_blacksky_record(
+                    $host,
+                    $did,
+                    $jwt,
+                    $record,
+                    0 === $index ? $embed : null
+                );
+            } else {
+                $response = $this->http->post_json(
+                    $endpoint,
+                    [ 'repo' => $did, 'collection' => 'app.bsky.feed.post', 'record' => $record ],
+                    [ 'Authorization' => 'Bearer ' . $jwt ]
+                );
+            }
             if ( is_wp_error( $response ) ) return $response;
 
             $ref = $this->record_ref_from_response( $response );
@@ -112,10 +123,120 @@ class PostCreator {
         }
 
         if ( count( $chunks ) > 1 ) {
-            $this->logger->info( 'Bluesky thread created.', [ 'post_id' => $post->ID, 'chunks' => count( $chunks ) ] );
+            $this->logger->info(
+                $blacksky_only ? 'Blacksky-only thread created.' : 'Bluesky thread created.',
+                [ 'post_id' => $post->ID, 'chunks' => count( $chunks ) ]
+            );
         }
 
         return $last_response;
+    }
+
+    private function create_blacksky_record(
+        string $host,
+        string $did,
+        string $jwt,
+        array $record,
+        ?array $embed
+    ) {
+        $rkey = $this->generate_record_key();
+
+        $submit = $record;
+        unset( $submit['$type'] );
+        $submit['rkey'] = $rkey;
+
+        $submitted = $this->http->post_json(
+            $host . '/xrpc/community.blacksky.feed.submitPost',
+            $submit,
+            [
+                'Authorization' => 'Bearer ' . $jwt,
+                'atproto-proxy' => self::BLACKSKY_APPVIEW_PROXY,
+            ]
+        );
+        if ( is_wp_error( $submitted ) ) return $submitted;
+
+        $cid = $submitted['cid'] ?? '';
+        if ( ! is_string( $cid ) || '' === $cid ) {
+            return new \WP_Error(
+                'ctb_blacksky_bad_submit_response',
+                'Blacksky did not return a CID for the submitted community post.'
+            );
+        }
+
+        $stub = [
+            '$type'     => 'community.blacksky.feed.post',
+            'createdAt' => $record['createdAt'],
+            'cid'       => $cid,
+        ];
+
+        if ( $embed ) {
+            $stub['embed'] = $embed;
+        }
+
+        $stub_response = $this->http->post_json(
+            $host . '/xrpc/com.atproto.repo.createRecord',
+            [
+                'repo'       => $did,
+                'collection' => 'community.blacksky.feed.post',
+                'rkey'       => $rkey,
+                'record'     => $stub,
+            ],
+            [ 'Authorization' => 'Bearer ' . $jwt ]
+        );
+
+        if ( is_wp_error( $stub_response ) ) {
+            $submitted_uri = $submitted['uri'] ?? '';
+            if ( is_string( $submitted_uri ) && '' !== $submitted_uri ) {
+                $cleanup = $this->http->post_json(
+                    $host . '/xrpc/community.blacksky.feed.deletePost',
+                    [ 'uri' => $submitted_uri ],
+                    [
+                        'Authorization' => 'Bearer ' . $jwt,
+                        'atproto-proxy' => self::BLACKSKY_APPVIEW_PROXY,
+                    ]
+                );
+
+                if ( is_wp_error( $cleanup ) ) {
+                    $this->logger->error(
+                        'Blacksky cleanup failed after PDS stub creation failed: ' . $cleanup->get_error_message(),
+                        [ 'uri' => $submitted_uri ]
+                    );
+                }
+            }
+
+            return $stub_response;
+        }
+
+        $submitted_uri = $submitted['uri'] ?? '';
+        if ( ! is_string( $submitted_uri ) || '' === $submitted_uri ) {
+            return new \WP_Error(
+                'ctb_blacksky_bad_submit_response',
+                'Blacksky did not return a URI for the submitted community post.'
+            );
+        }
+
+        return [
+            // Replies must reference the AppView's canonical community content,
+            // not the PDS stub's own record CID.
+            'uri' => $submitted_uri,
+            'cid' => $cid,
+        ];
+    }
+
+    private function generate_record_key(): string {
+        static $last = 0;
+        $micros = (int) floor( microtime( true ) * 1000000 );
+        $value = ( $micros * 1024 ) + random_int( 0, 1023 );
+        if ( $value <= $last ) $value = $last + 1;
+        $last = $value;
+
+        $alphabet = '234567abcdefghijklmnopqrstuvwxyz';
+        $encoded = '';
+        for ( $i = 0; $i < 13; $i++ ) {
+            $encoded = $alphabet[ $value % 32 ] . $encoded;
+            $value = intdiv( $value, 32 );
+        }
+        return $encoded;
     }
 
     private function record_ref_from_response( array $response ): ?array {
