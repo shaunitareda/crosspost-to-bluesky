@@ -33,7 +33,6 @@ class PostCreator {
 
         $embed = null;
 
-        // ── Video takes priority over images (can't embed both) ───────────
         $video_embed = null;
         if ( $this->options->get( 'video_enabled', 1 ) ) {
             $video_embed = $this->collect_video( $post, $jwt, $did );
@@ -43,13 +42,11 @@ class PostCreator {
             $embed = $video_embed;
             $this->logger->info( 'Video embed attached to Bluesky post.', [ 'post_id' => $post->ID ] );
         } else {
-            // No video — try images
             $images = $this->collect_images( $post, $jwt );
             if ( ! empty( $images ) ) {
                 $embed = [ '$type' => 'app.bsky.embed.images', 'images' => $images ];
                 $this->logger->info( count( $images ) . ' image(s) attached.', [ 'post_id' => $post->ID ] );
             } else {
-                // No native media — ordinary web URLs may become one external card.
                 $primary_url = $this->find_primary_url( $text );
                 if ( $primary_url ) {
                     $card = $this->build_external_embed( $primary_url, $jwt );
@@ -219,8 +216,6 @@ class PostCreator {
         }
 
         return [
-            // Replies must reference the AppView's canonical community content,
-            // not the PDS stub's own record CID.
             'uri' => $submitted_uri,
             'cid' => $cid,
         ];
@@ -249,26 +244,15 @@ class PostCreator {
         return [ 'uri' => $uri, 'cid' => $cid ];
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // VIDEO
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /**
-     * Look for a video attachment. Checks:
-     *  1. get_attached_media('video') — Enable Mastodon Apps / Social Notes uploads
-     *  2. Featured video (post_format video or video block in content)
-     * Returns a fully-formed app.bsky.embed.video record or null if no video found.
-     */
     private function collect_video( \WP_Post $post, string $jwt, string $did ): ?array {
         $video_attachments = get_attached_media( 'video', $post );
         $this->logger->debug( 'Video: attached media count.', [ 'count' => count( $video_attachments ) ] );
 
         if ( ! empty( $video_attachments ) ) {
-            $att = reset( $video_attachments ); // first video only (Bluesky supports one)
+            $att = reset( $video_attachments );
             return $this->upload_video_attachment( $att->ID, $jwt, $did, $post );
         }
 
-        // Check for a video attachment set as post thumbnail (rare but possible)
         $thumb_id = get_post_thumbnail_id( $post->ID );
         if ( $thumb_id ) {
             $mime = get_post_mime_type( $thumb_id );
@@ -277,15 +261,12 @@ class PostCreator {
             }
         }
 
-        // Scrape <video src> or <source src> from post content
         if ( ! empty( $post->post_content ) ) {
             $url = $this->extract_video_url( $post->post_content );
             if ( $url ) {
                 $this->logger->debug( 'Video: found URL in content.', [ 'url' => $url ] );
-                // Check if it maps to a local attachment first
                 $att_id = attachment_url_to_postid( $url );
                 if ( $att_id ) return $this->upload_video_attachment( $att_id, $jwt, $did, $post );
-                // External URL — not supported via simple upload; log and skip
                 $this->logger->debug( 'Video: external URL found but not uploaded (local attachments only).', [ 'url' => $url ] );
             }
         }
@@ -326,10 +307,6 @@ class PostCreator {
         if ( preg_match( '/<source[^>]+src=["\']([^"\']+)["\'][^>]+type=["\']video\/[^"\']+["\'][^>]*>/i', $content, $m ) ) return $m[1];
         return null;
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // IMAGES  (unchanged three-tier logic)
-    // ─────────────────────────────────────────────────────────────────────────
 
     private function collect_images( \WP_Post $post, string $jwt ): array {
         $blobs = []; $seen_ids = [];
@@ -388,10 +365,6 @@ class PostCreator {
         if ( preg_match( '/<img[^>]+alt=["\']([^"\']*)["\'][^>]+src=["\']' . $e . '["\'][^>]*>/i', $content, $m ) ) return $m[1];
         return '';
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // EXTERNAL LINK CARDS
-    // ─────────────────────────────────────────────────────────────────────────
 
     private function find_primary_url( string $text ): ?string {
         if ( ! preg_match( '~https?://[^\s<>"\']+~iu', $text, $match ) ) return null;
@@ -478,10 +451,6 @@ class PostCreator {
         return $origin . $dir . $candidate;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // TEXT / THREADING / FACETS
-    // ─────────────────────────────────────────────────────────────────────────
-
     private function build_text( \WP_Post $post ): string {
         $template  = (string) $this->options->get( 'template', "{title}\n{content}" );
         $title     = wp_strip_all_tags( html_entity_decode( get_the_title( $post ), ENT_QUOTES, 'UTF-8' ) );
@@ -489,12 +458,13 @@ class PostCreator {
         $excerpt   = has_excerpt( $post ) ? wp_strip_all_tags( html_entity_decode( $post->post_excerpt, ENT_QUOTES, 'UTF-8' ) ) : wp_trim_words( $raw, 55, '...' );
         $content   = $raw;
         $permalink = get_permalink( $post );
-        $is_note   = ( ! $title || 'post-format-status' === get_post_format( $post ) || $post->post_type === 'indieblocks_note' );
+        $is_social_note = $post->post_type === 'jetpack-social-note';
+        $is_note   = ( ! $title || 'post-format-status' === get_post_format( $post ) || $post->post_type === 'indieblocks_note' || $is_social_note );
         if ( $is_note ) $template = preg_replace( '/^\{title\}\s*/m', '', $template );
         if ( false !== strpos( $template, '{title}' ) && false !== strpos( $template, '{content}' ) ) $template = preg_replace( '/\{title\}\s*\R+\s*\{content\}/u', '{title} {content}', $template );
         if ( false !== strpos( $template, '{title}' ) && false !== strpos( $template, '{content}' ) && '' !== $title ) $content = $this->strip_leading_duplicate_title( $title, $content );
-        $text = strtr( $template, [ '{title}' => $title, '{excerpt}' => $excerpt, '{content}' => $content, '{url}' => $permalink ] );
-        if ( $this->options->get( 'include_permalink', 0 ) ) $text .= "\n\n" . $permalink;
+        $text = strtr( $template, [ '{title}' => $title, '{excerpt}' => $excerpt, '{content}' => $content, '{url}' => $is_social_note ? '' : $permalink ] );
+        if ( ! $is_social_note && $this->options->get( 'include_permalink', 0 ) ) $text .= "\n\n" . $permalink;
         $text = trim( preg_replace( '/\n{3,}/', "\n\n", $text ) );
         $this->logger->debug( 'Built text.', [ 'text' => $text ] );
         return $text;
